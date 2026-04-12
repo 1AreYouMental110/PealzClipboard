@@ -28,6 +28,7 @@ let clipboardPoller   = null;
 let lastClipboardText = '';
 let isWindowVisible   = false;
 let isAnimating       = false;
+let previousPid       = 0;   // PID of the app that had focus when we opened
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 let dataDir     = '';
@@ -206,36 +207,33 @@ let checkFocusScript      = null;
 function ensureCheckScript() {
   if (checkFocusScript) return checkFocusScript;
   checkFocusScript = path.join(dataDir || app.getPath('userData'), 'checkfocus.ps1');
-  // Detect text inputs via multiple UIAutomation strategies:
-  // 1. ControlType.Edit (50004) / Document (50030) — standard controls
-  // 2. TextPattern — covers Chrome/Electron contenteditable (Discord, VS Code…)
-  // 3. ValuePattern (not read-only) — simpler custom inputs
+  // Output format: "inField:pid"  e.g. "1:12345" or "0:12345"
+  // pid lets the paste script use AppActivate to explicitly restore the target window.
   const ps = [
     'Add-Type -AssemblyName UIAutomationClient',
     'Add-Type -AssemblyName UIAutomationTypes',
     'try {',
     '  $el = [System.Windows.Automation.AutomationElement]::FocusedElement',
-    '  if ($null -eq $el) { Write-Output 0; exit }',
+    '  if ($null -eq $el) { Write-Output "0:0"; exit }',
+    '  $procId = $el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::ProcessIdProperty)',
     '  $ct = $el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::ControlTypeProperty)',
-    '  if ($ct.Id -eq 50004 -or $ct.Id -eq 50030) { Write-Output 1; exit }',
+    '  if ($ct.Id -eq 50004 -or $ct.Id -eq 50030) { Write-Output "1:$procId"; exit }',
     '  $pats = $el.GetSupportedPatterns()',
-    '  if ($pats -contains [System.Windows.Automation.TextPattern]::Pattern) { Write-Output 1; exit }',
+    '  if ($pats -contains [System.Windows.Automation.TextPattern]::Pattern) { Write-Output "1:$procId"; exit }',
     '  if ($pats -contains [System.Windows.Automation.ValuePattern]::Pattern) {',
     '    $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)',
-    '    if (-not $vp.Current.IsReadOnly) { Write-Output 1; exit }',
+    '    if (-not $vp.Current.IsReadOnly) { Write-Output "1:$procId"; exit }',
     '  }',
-    // Fallback: Chrome/Electron apps (Discord, VS Code, Slack, etc.) use web-based
-    // inputs that UIAutomation often can't see via element type alone.
-    // If the focused process is a known browser/editor/chat app, assume text input.
-    '  $procId = $el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::ProcessIdProperty)',
+    // Process-name fallback: Chrome/Electron apps expose text inputs via web APIs
+    // that UIAutomation often misses. Match by process name instead.
     '  $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue',
     '  if ($proc) {',
     '    $n = $proc.ProcessName.ToLower()',
     '    $webApps = @("discord","chrome","msedge","firefox","code","slack","teams","notion","obsidian","brave","opera","vivaldi","electron","atom","sublime_text","notepad","wordpad","winword","onenote","outlook")',
-    '    foreach ($a in $webApps) { if ($n -like "*$a*") { Write-Output 1; exit } }',
+    '    foreach ($a in $webApps) { if ($n -like "*$a*") { Write-Output "1:$procId"; exit } }',
     '  }',
-    '  Write-Output 0',
-    '} catch { Write-Output 0 }'
+    '  Write-Output "0:$procId"',   // Not a text field, but still return the pid
+    '} catch { Write-Output "0:0" }'
   ].join('\r\n');
   try { fs.writeFileSync(checkFocusScript, ps, 'utf8'); }
   catch(e) { logger.warn('[textfield] script write failed:', e.message); checkFocusScript = null; }
@@ -247,18 +245,21 @@ function detectTextField() {
   if (!ps) { textFieldCheckPromise = Promise.resolve(false); return; }
 
   textFieldCheckPromise = new Promise((resolve) => {
-    // Hard cap: if PS takes >900ms, default to false (don't risk a stray paste)
-    const fallback = setTimeout(() => resolve(false), 900);
+    // Hard cap: if PS takes >1500ms, default to false
+    const fallback = setTimeout(() => resolve(false), 1500);
 
-    // -NoProfile -NonInteractive: skip user profile = ~150ms faster startup
     exec(
       `powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
-      { windowsHide: true, timeout: 1500 },
+      { windowsHide: true, timeout: 2000 },
       (err, stdout) => {
         clearTimeout(fallback);
-        const result = !err && stdout.trim() === '1';
-        logger.info('[textfield]', result ? 'text input detected' : 'not in text input');
-        resolve(result);
+        const output  = (stdout || '').trim();
+        const [inFieldStr, pidStr] = output.split(':');
+        const inField = !err && inFieldStr === '1';
+        const pid     = parseInt(pidStr || '0') || 0;
+        if (pid > 0) previousPid = pid;   // Always store — used by paste even if !inField
+        logger.info('[textfield]', inField ? 'text input detected' : 'not in text input', `pid=${pid}`);
+        resolve(inField);
       }
     );
   });
@@ -273,10 +274,23 @@ let pasteVbsPath = null;
 function ensurePasteScript() {
   if (pasteVbsPath) return pasteVbsPath;
   pasteVbsPath = path.join(dataDir || app.getPath('userData'), 'paste.vbs');
+  // Accepts an optional PID argument: wscript paste.vbs 1234
+  // AppActivate(pid) explicitly brings the target window to the foreground
+  // before SendKeys — fixes the case where blur() alone didn't restore focus.
   try {
     fs.writeFileSync(
       pasteVbsPath,
-      'Set s=CreateObject("WScript.Shell")\r\ns.SendKeys "^v"\r\n',
+      [
+        'Set s = CreateObject("WScript.Shell")',
+        'If WScript.Arguments.Count > 0 Then',
+        '  On Error Resume Next',
+        '  s.AppActivate CInt(WScript.Arguments(0))',
+        '  WScript.Sleep 80',
+        '  On Error GoTo 0',
+        'End If',
+        's.SendKeys "^v"',
+        ''
+      ].join('\r\n'),
       'utf8'
     );
   } catch(e) {
@@ -286,15 +300,16 @@ function ensurePasteScript() {
   return pasteVbsPath;
 }
 
-function sendPaste(delayMs = 450) {
+function sendPaste(delayMs = 350) {
+  const pid = previousPid;   // Snapshot now — previousPid may change later
   setTimeout(() => {
     const vbs = ensurePasteScript();
+    // Pass the previous app's PID so AppActivate can restore it before SendKeys
+    const pidArg = pid > 0 ? ` ${pid}` : '';
     if (vbs) {
-      // wscript: Windows Scripting Host VBScript — starts in ~30ms
-      exec(`wscript //NoLogo //B "${vbs}"`, { windowsHide: true }, (err) => {
+      exec(`wscript //NoLogo //B "${vbs}"${pidArg}`, { windowsHide: true }, (err) => {
         if (!err) return;
         logger.warn('[paste] wscript failed, trying PowerShell:', err.message);
-        // Fallback: PowerShell with -NoProfile (no .NET profile load = faster)
         exec(
           'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "$s=New-Object -ComObject WScript.Shell;$s.SendKeys(\'^v\')"',
           { windowsHide: true },
