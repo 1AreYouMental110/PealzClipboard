@@ -62,11 +62,11 @@ function initUpdater(getWindow) {
     logger.error('[Updater] Error:', err.message);
   });
 
-  // First check 5 minutes after launch, then every 4 hours
+  // First check 10 seconds after launch, then every minute
   setTimeout(() => { try { autoUpdater.checkForUpdates(); } catch(e) { logger.error('[Updater]', e); } },
-    5 * 60 * 1000);
+    10 * 1000);
   setInterval(() => { try { autoUpdater.checkForUpdates(); } catch(e) { logger.error('[Updater]', e); } },
-    4 * 60 * 60 * 1000);
+    60 * 1000);
 
   // IPC: renderer can request install
   ipcMain.handle('install-update', () => {
