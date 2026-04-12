@@ -17,8 +17,9 @@
     appEl.classList.remove('hiding');
     appEl.classList.add('showing');
     Sounds.open();
-    const searchInput = panels[activeTab].querySelector('input[type="text"]');
-    if (searchInput) setTimeout(() => searchInput.focus(), 220);
+    // Don't auto-focus the search bar — window opens inactive so the user's
+    // previous focus (game chat, text editor, etc.) stays untouched.
+    // Clicking inside the window naturally focuses it.
   }
 
   function animateOut() {
@@ -88,8 +89,7 @@
 
     if (tabName === 'emoji') EmojiTab.refresh();
 
-    const searchInput = toPanel.querySelector('input[type="text"]');
-    if (searchInput) setTimeout(() => searchInput.focus(), 230);
+    // Don't steal focus on tab switch either — user may still be in another app
   }
 
   tabBtns.forEach(btn => {

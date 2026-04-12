@@ -4,6 +4,7 @@ const {
 } = require('electron');
 const path = require('path');
 const fs   = require('fs');
+const { exec } = require('child_process');
 
 // ── Performance flags ─────────────────────────────────────────────────────────
 // Must be set before app is ready
@@ -169,6 +170,42 @@ function makeTrayIcon() {
   return nativeImage.createFromDataURL('data:image/png;base64,' + b64);
 }
 
+// ── Paste simulation ──────────────────────────────────────────────────────────
+// Sends Ctrl+V to whatever window has focus after we hide.
+// Uses WScript.Shell which is built into every Windows install — no extra deps.
+
+function sendPaste(delayMs = 320) {
+  setTimeout(() => {
+    exec(
+      'powershell -WindowStyle Hidden -Command "$s=New-Object -ComObject WScript.Shell;$s.SendKeys(\'^v\')"',
+      { windowsHide: true },
+      (err) => { if (err) logger.warn('[paste]', err.message); }
+    );
+  }, delayMs);
+}
+
+// ── Window position ───────────────────────────────────────────────────────────
+// Places the window near the mouse cursor, clamped inside the work area.
+
+function getWindowPos() {
+  const cursor  = screen.getCursorScreenPoint();
+  const display = screen.getDisplayNearestPoint(cursor);
+  const { x: wx, y: wy, width: ww, height: wh } = display.workArea;
+
+  const winW = 460, winH = 600;
+
+  // Prefer above cursor; fall back to below if not enough space
+  let x = cursor.x - Math.round(winW / 2);
+  let y = cursor.y - winH - 10;
+  if (y < wy) y = cursor.y + 24;
+
+  // Clamp to work area
+  x = Math.max(wx, Math.min(x, wx + ww - winW));
+  y = Math.max(wy, Math.min(y, wy + wh - winH));
+
+  return { x, y };
+}
+
 // ── Window management ─────────────────────────────────────────────────────────
 
 function createWindow() {
@@ -234,11 +271,8 @@ function showWindow() {
   // Lazy creation — if window was never built (--hidden startup) build now
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
 
-  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
-  mainWindow.setPosition(
-    Math.round(width  / 2 - 230),
-    Math.round(height / 2 - 300)
-  );
+  const { x, y } = getWindowPos();
+  mainWindow.setPosition(x, y);
 
   isAnimating     = true;
   isWindowVisible = true;
@@ -248,8 +282,9 @@ function showWindow() {
   scheduleNextPoll();
 
   const doShow = () => {
-    mainWindow.show();
-    mainWindow.focus();
+    // showInactive = window appears without stealing focus from the game/app
+    // the user was typing in. They can still click into our window normally.
+    mainWindow.showInactive();
     mainWindow.webContents.send('window-showing');
     setTimeout(() => { isAnimating = false; }, 350);
   };
@@ -314,6 +349,9 @@ function setupIPC() {
   ipcMain.handle('copy-to-clipboard', (_e, { content }) => {
     clipboard.writeText(content);
     lastClipboardText = content;
+    // Hide window then paste into the previously focused app
+    hideWindow();
+    sendPaste();
     return true;
   });
 
@@ -351,6 +389,7 @@ function setupIPC() {
     clipboard.writeText(emoji);
     lastClipboardText = emoji;
     hideWindow();
+    sendPaste();
     return true;
   });
 
