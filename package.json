@@ -24,9 +24,10 @@
     "appId":       "com.pealz.clipboardmanager",
     "productName": "Clipboard Manager",
     "publish": {
-      "provider": "github",
-      "owner":    "1AreYouMental110",
-      "repo":     "PealzClipboard"
+      "provider":    "github",
+      "owner":       "1AreYouMental110",
+      "repo":        "PealzClipboard",
+      "releaseType": "release"
     },
     "win": {
       "target": [{ "target": "nsis", "arch": ["x64"] }],
