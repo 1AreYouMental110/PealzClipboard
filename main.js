@@ -215,6 +215,16 @@ function ensureCheckScript() {
     '    $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)',
     '    if (-not $vp.Current.IsReadOnly) { Write-Output 1; exit }',
     '  }',
+    // Fallback: Chrome/Electron apps (Discord, VS Code, Slack, etc.) use web-based
+    // inputs that UIAutomation often can't see via element type alone.
+    // If the focused process is a known browser/editor/chat app, assume text input.
+    '  $procId = $el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::ProcessIdProperty)',
+    '  $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue',
+    '  if ($proc) {',
+    '    $n = $proc.ProcessName.ToLower()',
+    '    $webApps = @("discord","chrome","msedge","firefox","code","slack","teams","notion","obsidian","brave","opera","vivaldi","electron","atom","sublime_text","notepad","wordpad","winword","onenote","outlook")',
+    '    foreach ($a in $webApps) { if ($n -like "*$a*") { Write-Output 1; exit } }',
+    '  }',
     '  Write-Output 0',
     '} catch { Write-Output 0 }'
   ].join('\r\n');
@@ -481,11 +491,16 @@ function setupIPC() {
   safeHandle('copy-to-clipboard', (_e, { content }) => {
     clipboard.writeText(content);
     lastClipboardText = content;
-    // Return immediately — renderer gets its toast/flash with zero delay.
     // Paste fires asynchronously once the text-field check resolves.
+    // blur() hands focus back to the previous app BEFORE we paste —
+    // without it, Discord/etc. won't have focus when Ctrl+V fires.
     textFieldCheckPromise.then(inField => {
-      if (inField) { hideWindow(); sendPaste(260); }
-    }).catch(() => {});
+      if (inField) {
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.blur(); } catch {}
+        sendPaste(500); // 500ms: 200ms hide animation + 300ms focus transfer buffer
+      }
+      hideWindow(); // always close the picker after copying
+    }).catch(() => hideWindow());
     return true;
   });
 
@@ -522,10 +537,13 @@ function setupIPC() {
   safeHandle('copy-emoji', (_e, { emoji }) => {
     clipboard.writeText(emoji);
     lastClipboardText = emoji;
-    hideWindow(); // always close immediately for emoji
     textFieldCheckPromise.then(inField => {
-      if (inField) sendPaste();
-    }).catch(() => {});
+      if (inField) {
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.blur(); } catch {}
+        sendPaste(500);
+      }
+      hideWindow();
+    }).catch(() => hideWindow());
     return true;
   });
 
