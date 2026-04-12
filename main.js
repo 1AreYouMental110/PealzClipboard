@@ -122,9 +122,11 @@ function registerStartup() {
 }
 
 // ── Clipboard monitor ─────────────────────────────────────────────────────────
-// Adaptive polling: 500ms while visible, 2s while hidden.
-const POLL_FAST = 500;
-const POLL_SLOW = 2000;
+// Poll every 500ms always. Clipboard reads are extremely cheap (single Win32
+// call) so there is no meaningful CPU cost. 2s was too slow — users copying
+// multiple things quickly or opening the window right after a copy would miss
+// items entirely.
+const POLL_INTERVAL = 500;
 
 function startClipboardMonitor() {
   try { lastClipboardText = clipboard.readText(); } catch {}
@@ -133,7 +135,7 @@ function startClipboardMonitor() {
 
 function scheduleNextPoll() {
   if (clipboardPoller) return;
-  clipboardPoller = setTimeout(pollClipboard, isWindowVisible ? POLL_FAST : POLL_SLOW);
+  clipboardPoller = setTimeout(pollClipboard, POLL_INTERVAL);
 }
 
 function pollClipboard() {
@@ -148,6 +150,13 @@ function pollClipboard() {
     logger.warn('[clipboard] read error:', e.message);
   }
   scheduleNextPoll();
+}
+
+// Immediate one-off poll — called when window opens so the list is always
+// current even if the regular timer hasn't fired yet.
+function pollNow() {
+  if (clipboardPoller) { clearTimeout(clipboardPoller); clipboardPoller = null; }
+  pollClipboard();
 }
 
 function addClipboardItem(content, type) {
@@ -406,8 +415,9 @@ function showWindow() {
   isAnimating     = true;
   isWindowVisible = true;
 
-  if (clipboardPoller) { clearTimeout(clipboardPoller); clipboardPoller = null; }
-  scheduleNextPoll();
+  // Immediately capture any clipboard content copied since the last poll
+  // so the list is always up-to-date the instant the window appears.
+  pollNow();
 
   const doShow = () => {
     try {
@@ -436,9 +446,6 @@ function hideWindow() {
 
   isAnimating     = true;
   isWindowVisible = false;
-
-  if (clipboardPoller) { clearTimeout(clipboardPoller); clipboardPoller = null; }
-  scheduleNextPoll();
 
   try { mainWindow.webContents.send('window-hiding'); } catch {}
   setTimeout(() => {
