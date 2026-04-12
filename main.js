@@ -6,36 +6,30 @@ const path = require('path');
 const fs   = require('fs');
 const { exec } = require('child_process');
 
-// ── Performance flags ─────────────────────────────────────────────────────────
-// Must be set before app is ready
+// ── Performance flags (must be before app ready) ──────────────────────────────
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=96');
 app.commandLine.appendSwitch('disable-background-networking');
 app.commandLine.appendSwitch('disable-client-side-phishing-detection');
 app.commandLine.appendSwitch('disable-default-apps');
-
-// Disable GPU compositing — fixes transparent window crashes on many systems
 app.disableHardwareAcceleration();
 
 const logger = require('./logger');
 const { initUpdater } = require('./updater');
 
+// ── Global crash guards ───────────────────────────────────────────────────────
+// Catch anything that slips through — prevents silent process death.
+process.on('uncaughtException',  (err) => logger.error('[uncaughtException]',  err.stack || err));
+process.on('unhandledRejection', (err) => logger.error('[unhandledRejection]', err));
+
+// ── State ─────────────────────────────────────────────────────────────────────
 let mainWindow        = null;
 let tray              = null;
 let clipboardPoller   = null;
 let lastClipboardText = '';
 let isWindowVisible   = false;
-let isAnimating       = false; // guard against blur firing during show/hide
-
-// ── Text-field detection ──────────────────────────────────────────────────────
-// Fired at window-open time while the previous app still holds focus.
-// Returns a Promise<boolean> so the IPC handler can await it without blocking
-// the UI — the renderer gets its response instantly while the check runs async.
-
-let textFieldCheckPromise = Promise.resolve(false);
-let checkFocusScript      = null;
+let isAnimating       = false;
 
 // ── Storage ───────────────────────────────────────────────────────────────────
-
 let dataDir     = '';
 let historyPath = '';
 let emojiPath   = '';
@@ -44,6 +38,29 @@ let emojiData   = { favorites: [] };
 let nextId      = 1;
 let saveTimer   = null;
 
+function loadJson(filePath, fallback) {
+  if (!fs.existsSync(filePath)) return fallback;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed || fallback;
+  } catch(e) {
+    logger.warn(`[storage] failed to parse ${path.basename(filePath)}:`, e.message);
+    // Try .tmp backup (written atomically — may be a newer complete copy)
+    const tmp = filePath + '.tmp';
+    if (fs.existsSync(tmp)) {
+      try { return JSON.parse(fs.readFileSync(tmp, 'utf8')) || fallback; } catch {}
+    }
+    return fallback;
+  }
+}
+
+function writeJson(filePath, data) {
+  // Atomic write: write to .tmp then rename so a crash mid-write never corrupts
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
 function initStorage() {
   dataDir     = app.getPath('userData');
   historyPath = path.join(dataDir, 'history.json');
@@ -51,77 +68,72 @@ function initStorage() {
 
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
-  if (fs.existsSync(historyPath)) {
-    try { historyData = JSON.parse(fs.readFileSync(historyPath, 'utf8')); }
-    catch(e) { logger.warn('history.json parse error:', e.message); historyData = { items: [] }; }
-  }
-  if (fs.existsSync(emojiPath)) {
-    try { emojiData = JSON.parse(fs.readFileSync(emojiPath, 'utf8')); }
-    catch(e) { logger.warn('emoji-favorites.json parse error:', e.message); emojiData = { favorites: [] }; }
-  }
+  historyData = loadJson(historyPath, { items: [] });
+  emojiData   = loadJson(emojiPath,   { favorites: [] });
 
   if (!Array.isArray(historyData.items))   historyData.items   = [];
   if (!Array.isArray(emojiData.favorites)) emojiData.favorites = [];
 
+  // Sanitise: remove any items with missing/corrupt fields
+  historyData.items = historyData.items.filter(
+    i => i && typeof i.id === 'number' && typeof i.content === 'string'
+  );
+
   nextId = historyData.items.reduce((m, i) => Math.max(m, i.id || 0), 0) + 1;
-  logger.info('Storage ready. Items:', historyData.items.length);
+  logger.info('[storage] ready — items:', historyData.items.length);
 }
 
 function saveHistory() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    try { fs.writeFileSync(historyPath, JSON.stringify(historyData), 'utf8'); }
-    catch(e) { logger.error('saveHistory failed:', e); }
+    try { writeJson(historyPath, historyData); }
+    catch(e) { logger.error('[storage] saveHistory failed:', e.message); }
   }, 400);
 }
 
 function saveEmojis() {
-  try { fs.writeFileSync(emojiPath, JSON.stringify(emojiData), 'utf8'); }
-  catch(e) { logger.error('saveEmojis failed:', e); }
+  try { writeJson(emojiPath, emojiData); }
+  catch(e) { logger.error('[storage] saveEmojis failed:', e.message); }
 }
 
-// ── Register startup ──────────────────────────────────────────────────────────
+function flushSync() {
+  // Called from will-quit — synchronously flush any pending saves.
+  clearTimeout(saveTimer);
+  try { writeJson(historyPath, historyData); } catch {}
+  try { writeJson(emojiPath,   emojiData);   } catch {}
+}
 
+// ── Startup registration ──────────────────────────────────────────────────────
 function registerStartup() {
   try {
     const appDir      = path.resolve(__dirname);
     const electronCmd = path.join(appDir, 'node_modules', '.bin', 'electron.cmd');
-
-    const startupFolder = path.join(
+    const batPath = path.join(
       process.env.APPDATA,
-      'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'
+      'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup',
+      'ClipboardManager.bat'
     );
-    const batPath = path.join(startupFolder, 'ClipboardManager.bat');
-
-    const bat = [
-      '@echo off',
-      `cd /d "${appDir}"`,
-      `start "" /B "${electronCmd}" . --hidden`,
-      ''
-    ].join('\r\n');
-
+    const bat = ['@echo off', `cd /d "${appDir}"`, `start "" /B "${electronCmd}" . --hidden`, ''].join('\r\n');
     fs.writeFileSync(batPath, bat, 'utf8');
-    logger.info('Startup registered:', batPath);
+    logger.info('[startup] registered:', batPath);
   } catch(e) {
-    logger.warn('Could not register startup:', e.message);
+    logger.warn('[startup] could not register:', e.message);
   }
 }
 
-// ── Clipboard monitoring ──────────────────────────────────────────────────────
-// Adaptive polling: fast (500ms) when window is visible, slow (2s) when hidden
-
+// ── Clipboard monitor ─────────────────────────────────────────────────────────
+// Adaptive polling: 500ms while visible, 2s while hidden.
 const POLL_FAST = 500;
 const POLL_SLOW = 2000;
 
 function startClipboardMonitor() {
-  lastClipboardText = clipboard.readText();
+  try { lastClipboardText = clipboard.readText(); } catch {}
   scheduleNextPoll();
 }
 
 function scheduleNextPoll() {
-  if (clipboardPoller) return; // already scheduled
-  const delay = isWindowVisible ? POLL_FAST : POLL_SLOW;
-  clipboardPoller = setTimeout(pollClipboard, delay);
+  if (clipboardPoller) return;
+  clipboardPoller = setTimeout(pollClipboard, isWindowVisible ? POLL_FAST : POLL_SLOW);
 }
 
 function pollClipboard() {
@@ -133,7 +145,7 @@ function pollClipboard() {
       addClipboardItem(text, 'text');
     }
   } catch(e) {
-    logger.warn('clipboard read error:', e.message);
+    logger.warn('[clipboard] read error:', e.message);
   }
   scheduleNextPoll();
 }
@@ -144,6 +156,7 @@ function addClipboardItem(content, type) {
 
   items.unshift({ id: nextId++, content, type, timestamp: Date.now(), favorite: false });
 
+  // Keep at most 50k items; trim to 10k (preserving favorites) when over limit
   if (items.length > 50000) {
     historyData.items = items.filter((it, idx) => idx < 10000 || it.favorite);
   }
@@ -151,46 +164,43 @@ function addClipboardItem(content, type) {
   saveHistory();
 
   if (mainWindow && !mainWindow.isDestroyed() && isWindowVisible) {
-    mainWindow.webContents.send('clipboard-updated');
+    try { mainWindow.webContents.send('clipboard-updated'); } catch {}
   }
 }
 
-// ── Query ─────────────────────────────────────────────────────────────────────
-
-function queryHistory({ search, favoritesOnly, limit = 200, offset = 0 } = {}) {
-  let results = historyData.items;
-  if (favoritesOnly) results = results.filter(i => i.favorite);
-  if (search && search.trim()) {
-    const q = search.trim().toLowerCase();
-    results = results.filter(i => i.content.toLowerCase().includes(q));
+function queryHistory({ search, favoritesOnly, limit = 500, offset = 0 } = {}) {
+  try {
+    let results = historyData.items;
+    if (favoritesOnly) results = results.filter(i => i.favorite);
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      results = results.filter(i => i.content.toLowerCase().includes(q));
+    }
+    results = [...results].sort((a, b) => {
+      if (a.favorite !== b.favorite) return b.favorite ? 1 : -1;
+      return b.timestamp - a.timestamp;
+    });
+    return results.slice(offset, offset + limit);
+  } catch(e) {
+    logger.error('[query] queryHistory error:', e.message);
+    return [];
   }
-  results = [...results].sort((a, b) => {
-    if (a.favorite !== b.favorite) return b.favorite ? 1 : -1;
-    return b.timestamp - a.timestamp;
-  });
-  return results.slice(offset, offset + limit);
 }
 
-// ── Tray icon ─────────────────────────────────────────────────────────────────
+// ── Text-field detection ──────────────────────────────────────────────────────
+// Fired at window-open time while the previous app still holds focus.
+// Resolves to true = user was in a text input → auto-paste after copy.
 
-function makeTrayIcon() {
-  const b64 = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABmJLR0QA/wD/AP+gvaeTAAAAiElEQVQ4jd2SMQqAMAxFX8VFL+LFvIiHcHEv4eZiD+IhXNyLiAP+GNoSqAoFHwTy8pKXkCiSJEmSJEn6VwCIiCbpSboBrOoiZj4z86qqewBgZhcAmNktIs4A3IhobWaXmR0i4gmgBrACzgBeRaQCOI+ZOcANwBuAUyGkpJQaQxpDSuklAAAASUVORK5CYII=';
-  return nativeImage.createFromDataURL('data:image/png;base64,' + b64);
-}
-
-// ── Text-field focus check ────────────────────────────────────────────────────
-// Uses Windows UIAutomation to ask "is the currently focused element a text
-// input?".  We write a tiny PS1 script once on first use and reuse it, so
-// there's no repeated file-write overhead.
+let textFieldCheckPromise = Promise.resolve(false);
+let checkFocusScript      = null;
 
 function ensureCheckScript() {
   if (checkFocusScript) return checkFocusScript;
   checkFocusScript = path.join(dataDir || app.getPath('userData'), 'checkfocus.ps1');
-  // Broader detection than just ControlType IDs:
-  // • ControlType Edit (50004) = standard textbox/input
-  // • ControlType Document (50030) = rich text area
-  // • TextPattern = covers Chrome/Electron contenteditable (Discord message box, etc.)
-  // • ValuePattern (not read-only) = simpler custom inputs
+  // Detect text inputs via multiple UIAutomation strategies:
+  // 1. ControlType.Edit (50004) / Document (50030) — standard controls
+  // 2. TextPattern — covers Chrome/Electron contenteditable (Discord, VS Code…)
+  // 3. ValuePattern (not read-only) — simpler custom inputs
   const ps = [
     'Add-Type -AssemblyName UIAutomationClient',
     'Add-Type -AssemblyName UIAutomationTypes',
@@ -200,11 +210,9 @@ function ensureCheckScript() {
     '  $ct = $el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::ControlTypeProperty)',
     '  if ($ct.Id -eq 50004 -or $ct.Id -eq 50030) { Write-Output 1; exit }',
     '  $pats = $el.GetSupportedPatterns()',
-    '  $tpId = [System.Windows.Automation.TextPattern]::Pattern',
-    '  if ($pats -contains $tpId) { Write-Output 1; exit }',
-    '  $vpId = [System.Windows.Automation.ValuePattern]::Pattern',
-    '  if ($pats -contains $vpId) {',
-    '    $vp = $el.GetCurrentPattern($vpId)',
+    '  if ($pats -contains [System.Windows.Automation.TextPattern]::Pattern) { Write-Output 1; exit }',
+    '  if ($pats -contains [System.Windows.Automation.ValuePattern]::Pattern) {',
+    '    $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)',
     '    if (-not $vp.Current.IsReadOnly) { Write-Output 1; exit }',
     '  }',
     '  Write-Output 0',
@@ -220,70 +228,105 @@ function detectTextField() {
   if (!ps) { textFieldCheckPromise = Promise.resolve(false); return; }
 
   textFieldCheckPromise = new Promise((resolve) => {
-    // Safety valve: if PS takes longer than 900ms, assume no text field
+    // Hard cap: if PS takes >900ms, default to false (don't risk a stray paste)
     const fallback = setTimeout(() => resolve(false), 900);
 
+    // -NoProfile -NonInteractive: skip user profile = ~150ms faster startup
     exec(
-      `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
+      `powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
       { windowsHide: true, timeout: 1500 },
       (err, stdout) => {
         clearTimeout(fallback);
         const result = !err && stdout.trim() === '1';
-        logger.info('[textfield]', result ? 'text input detected' : 'no text input');
+        logger.info('[textfield]', result ? 'text input detected' : 'not in text input');
         resolve(result);
       }
     );
   });
 }
 
-// ── Paste simulation ──────────────────────────────────────────────────────────
-// Sends Ctrl+V to whatever window has focus after we hide.
-// Uses WScript.Shell which is built into every Windows install — no extra deps.
+// ── Paste ─────────────────────────────────────────────────────────────────────
+// Primary: wscript VBScript (~30ms, no .NET runtime).
+// Fallback: PowerShell -NoProfile (~150ms).
 
-function sendPaste(delayMs = 320) {
-  setTimeout(() => {
-    exec(
-      'powershell -WindowStyle Hidden -Command "$s=New-Object -ComObject WScript.Shell;$s.SendKeys(\'^v\')"',
-      { windowsHide: true },
-      (err) => { if (err) logger.warn('[paste]', err.message); }
+let pasteVbsPath = null;
+
+function ensurePasteScript() {
+  if (pasteVbsPath) return pasteVbsPath;
+  pasteVbsPath = path.join(dataDir || app.getPath('userData'), 'paste.vbs');
+  try {
+    fs.writeFileSync(
+      pasteVbsPath,
+      'Set s=CreateObject("WScript.Shell")\r\ns.SendKeys "^v"\r\n',
+      'utf8'
     );
+  } catch(e) {
+    logger.warn('[paste] vbs write failed:', e.message);
+    pasteVbsPath = null;
+  }
+  return pasteVbsPath;
+}
+
+function sendPaste(delayMs = 450) {
+  setTimeout(() => {
+    const vbs = ensurePasteScript();
+    if (vbs) {
+      // wscript: Windows Scripting Host VBScript — starts in ~30ms
+      exec(`wscript //NoLogo //B "${vbs}"`, { windowsHide: true }, (err) => {
+        if (!err) return;
+        logger.warn('[paste] wscript failed, trying PowerShell:', err.message);
+        // Fallback: PowerShell with -NoProfile (no .NET profile load = faster)
+        exec(
+          'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "$s=New-Object -ComObject WScript.Shell;$s.SendKeys(\'^v\')"',
+          { windowsHide: true },
+          (err2) => { if (err2) logger.warn('[paste] PS fallback also failed:', err2.message); }
+        );
+      });
+    } else {
+      exec(
+        'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "$s=New-Object -ComObject WScript.Shell;$s.SendKeys(\'^v\')"',
+        { windowsHide: true }
+      );
+    }
   }, delayMs);
 }
 
 // ── Window position ───────────────────────────────────────────────────────────
-// Places the window near the mouse cursor, clamped inside the work area.
-
 function getWindowPos() {
-  const cursor  = screen.getCursorScreenPoint();
-  const display = screen.getDisplayNearestPoint(cursor);
-  const { x: wx, y: wy, width: ww, height: wh } = display.workArea;
+  try {
+    const cursor  = screen.getCursorScreenPoint();
+    const display = screen.getDisplayNearestPoint(cursor);
+    const { x: wx, y: wy, width: ww, height: wh } = display.workArea;
+    const winW = 460, winH = 600;
+    let x = cursor.x - Math.round(winW / 2);
+    let y = cursor.y - winH - 10;
+    if (y < wy) y = cursor.y + 24;
+    x = Math.max(wx, Math.min(x, wx + ww - winW));
+    y = Math.max(wy, Math.min(y, wy + wh - winH));
+    return { x, y };
+  } catch {
+    // Fallback to centre if screen API fails
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+    return { x: Math.round(width / 2 - 230), y: Math.round(height / 2 - 300) };
+  }
+}
 
-  const winW = 460, winH = 600;
-
-  // Prefer above cursor; fall back to below if not enough space
-  let x = cursor.x - Math.round(winW / 2);
-  let y = cursor.y - winH - 10;
-  if (y < wy) y = cursor.y + 24;
-
-  // Clamp to work area
-  x = Math.max(wx, Math.min(x, wx + ww - winW));
-  y = Math.max(wy, Math.min(y, wy + wh - winH));
-
-  return { x, y };
+// ── Tray icon ─────────────────────────────────────────────────────────────────
+function makeTrayIcon() {
+  const b64 = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABmJLR0QA/wD/AP+gvaeTAAAAiElEQVQ4jd2SMQqAMAxFX8VFL+LFvIiHcHEv4eZiD+IhXNyLiAP+GNoSqAoFHwTy8pKXkCiSJEmSJEn6VwCIiCbpSboBrOoiZj4z86qqewBgZhcAmNktIs4A3IhobWaXmR0i4gmgBrACzgBeRaQCOI+ZOcANwBuAUyGkpJQaQxpDSuklAAAASUVORK5CYII=';
+  return nativeImage.createFromDataURL('data:image/png;base64,' + b64);
 }
 
 // ── Window management ─────────────────────────────────────────────────────────
-
 function createWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) return;
 
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
 
   mainWindow = new BrowserWindow({
-    width:           460,
-    height:          600,
-    x:               Math.round(width  / 2 - 230),
-    y:               Math.round(height / 2 - 300),
+    width:  460, height: 600,
+    x: Math.round(width / 2 - 230),
+    y: Math.round(height / 2 - 300),
     frame:           false,
     transparent:     true,
     backgroundColor: '#00000000',
@@ -297,7 +340,6 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration:  false,
       sandbox:          false,
-      // Performance: disable unused renderer features
       spellcheck:       false,
       enableWebSQL:     false
     }
@@ -305,17 +347,26 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
+  // Renderer crash → recreate silently so hotkey keeps working
   mainWindow.webContents.on('render-process-gone', (_e, details) => {
-    logger.error('Renderer crashed — reason:', details.reason, '| exit code:', details.exitCode);
-    mainWindow = null;
+    logger.error('[renderer] crashed — reason:', details.reason, 'code:', details.exitCode);
+    const win = mainWindow;
+    mainWindow      = null;
     isWindowVisible = false;
-    isAnimating = false;
-    // Recreate window so hotkey still works after crash
-    setTimeout(createWindow, 500);
+    isAnimating     = false;
+    if (win && !win.isDestroyed()) { try { win.destroy(); } catch {} }
+    setTimeout(createWindow, 600);
   });
 
-  mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
-    logger.error('Renderer failed to load:', code, desc);
+  // Page failed to load → reload once
+  mainWindow.webContents.once('did-fail-load', (_e, code, desc, url, isMain) => {
+    if (!isMain) return;
+    logger.warn('[renderer] load failed:', code, desc, '— reloading');
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+      }
+    }, 500);
   });
 
   mainWindow.on('blur', () => {
@@ -323,45 +374,49 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
-    mainWindow = null;
+    mainWindow      = null;
     isWindowVisible = false;
   });
 
-  // Wire updater once window is created
   initUpdater(() => mainWindow);
 }
 
 function showWindow() {
   if (isAnimating) return;
-
-  // Lazy creation — if window was never built (--hidden startup) build now
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
 
-  // Check NOW — previous app still has focus (showInactive hasn't run yet)
+  // Detect text field NOW — previous app still has focus before showInactive()
   detectTextField();
 
-  const { x, y } = getWindowPos();
-  mainWindow.setPosition(x, y);
+  try {
+    const { x, y } = getWindowPos();
+    mainWindow.setPosition(x, y);
+  } catch {}
 
   isAnimating     = true;
   isWindowVisible = true;
 
-  // Switch to fast polling while visible
   if (clipboardPoller) { clearTimeout(clipboardPoller); clipboardPoller = null; }
   scheduleNextPoll();
 
   const doShow = () => {
-    // showInactive = window appears without stealing focus from the game/app
-    // the user was typing in. They can still click into our window normally.
-    mainWindow.showInactive();
-    mainWindow.webContents.send('window-showing');
+    try {
+      // showInactive: appears without stealing focus from whatever the user was typing in
+      mainWindow.showInactive();
+      mainWindow.webContents.send('window-showing');
+    } catch(e) { logger.warn('[window] showInactive failed:', e.message); }
     setTimeout(() => { isAnimating = false; }, 350);
   };
 
-  if (mainWindow.webContents.isLoading()) {
-    mainWindow.webContents.once('did-finish-load', doShow);
-  } else {
-    doShow();
+  try {
+    if (mainWindow.webContents.isLoading()) {
+      mainWindow.webContents.once('did-finish-load', doShow);
+    } else {
+      doShow();
+    }
+  } catch(e) {
+    isAnimating = false;
+    logger.warn('[window] showWindow error:', e.message);
   }
 }
 
@@ -372,13 +427,12 @@ function hideWindow() {
   isAnimating     = true;
   isWindowVisible = false;
 
-  // Switch back to slow polling when hidden
   if (clipboardPoller) { clearTimeout(clipboardPoller); clipboardPoller = null; }
   scheduleNextPoll();
 
-  mainWindow.webContents.send('window-hiding');
+  try { mainWindow.webContents.send('window-hiding'); } catch {}
   setTimeout(() => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide();
+    try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); } catch {}
     isAnimating = false;
   }, 200);
 }
@@ -389,64 +443,73 @@ function toggleWindow() {
 }
 
 // ── Tray ──────────────────────────────────────────────────────────────────────
-
 function createTray() {
-  try {
-    tray = new Tray(makeTrayIcon());
-  } catch(e) {
-    tray = new Tray(nativeImage.createEmpty());
-  }
+  try { tray = new Tray(makeTrayIcon()); }
+  catch { tray = new Tray(nativeImage.createEmpty()); }
   tray.setToolTip('Clipboard Manager');
   tray.on('click', toggleWindow);
   updateTrayMenu('Alt+V');
 }
 
 function updateTrayMenu(hotkey) {
-  tray.setToolTip(`Clipboard Manager — ${hotkey}`);
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: `Open  (${hotkey})`, click: showWindow },
-    { type:  'separator' },
-    { label: 'Quit', click: () => app.quit() }
-  ]));
+  try {
+    tray.setToolTip(`Clipboard Manager — ${hotkey}`);
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: `Open  (${hotkey})`, click: showWindow },
+      { type: 'separator' },
+      { label: 'Quit', click: () => app.quit() }
+    ]));
+  } catch {}
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
+// safeHandle: wraps every handler in try-catch so a bug in one handler can
+// never propagate to the renderer or crash the main process.
+function safeHandle(channel, fn) {
+  ipcMain.handle(channel, async (e, ...args) => {
+    try { return await fn(e, ...args); }
+    catch(err) {
+      logger.error(`[IPC] ${channel} threw:`, err.message || err);
+      return null;
+    }
+  });
+}
 
 function setupIPC() {
-  ipcMain.handle('get-clipboard-history', (_e, opts) => queryHistory(opts || {}));
+  safeHandle('get-clipboard-history', (_e, opts) => queryHistory(opts || {}));
 
-  ipcMain.handle('copy-to-clipboard', (_e, { content }) => {
+  safeHandle('copy-to-clipboard', (_e, { content }) => {
     clipboard.writeText(content);
     lastClipboardText = content;
-    // Return immediately so the renderer shows its toast/flash with zero delay.
-    // Paste (if applicable) happens once the async text-field check resolves.
+    // Return immediately — renderer gets its toast/flash with zero delay.
+    // Paste fires asynchronously once the text-field check resolves.
     textFieldCheckPromise.then(inField => {
       if (inField) { hideWindow(); sendPaste(260); }
-    });
+    }).catch(() => {});
     return true;
   });
 
-  ipcMain.handle('toggle-favorite', (_e, { id, value }) => {
+  safeHandle('toggle-favorite', (_e, { id, value }) => {
     const item = historyData.items.find(i => i.id === id);
     if (item) { item.favorite = !!value; saveHistory(); }
     return true;
   });
 
-  ipcMain.handle('delete-clipboard-item', (_e, { id }) => {
+  safeHandle('delete-clipboard-item', (_e, { id }) => {
     historyData.items = historyData.items.filter(i => i.id !== id);
     saveHistory();
     return true;
   });
 
-  ipcMain.handle('clear-clipboard-history', () => {
+  safeHandle('clear-clipboard-history', () => {
     historyData.items = historyData.items.filter(i => i.favorite);
     saveHistory();
     return true;
   });
 
-  ipcMain.handle('get-emoji-favorites', () => emojiData.favorites);
+  safeHandle('get-emoji-favorites', () => emojiData.favorites);
 
-  ipcMain.handle('toggle-emoji-favorite', (_e, { emoji, isFav }) => {
+  safeHandle('toggle-emoji-favorite', (_e, { emoji, isFav }) => {
     if (isFav) {
       if (!emojiData.favorites.includes(emoji)) emojiData.favorites.unshift(emoji);
     } else {
@@ -456,60 +519,62 @@ function setupIPC() {
     return true;
   });
 
-  ipcMain.handle('copy-emoji', (_e, { emoji }) => {
+  safeHandle('copy-emoji', (_e, { emoji }) => {
     clipboard.writeText(emoji);
     lastClipboardText = emoji;
     hideWindow(); // always close immediately for emoji
-    textFieldCheckPromise.then(inField => { if (inField) sendPaste(); });
+    textFieldCheckPromise.then(inField => {
+      if (inField) sendPaste();
+    }).catch(() => {});
     return true;
   });
 
-  ipcMain.handle('hide-window', () => hideWindow());
+  safeHandle('hide-window', () => hideWindow());
 
-  ipcMain.handle('get-stats', () => ({
+  safeHandle('get-stats', () => ({
     count:    historyData.items.length,
     favCount: historyData.items.filter(i => i.favorite).length
   }));
+
+  safeHandle('install-update', () => {
+    try {
+      const { autoUpdater } = require('electron-updater');
+      autoUpdater.quitAndInstall(false, true);
+    } catch(e) { logger.error('[updater] install failed:', e.message); }
+  });
 }
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
-
 app.whenReady().then(() => {
-  logger.info('App starting. Version:', app.getVersion(), '| Packaged:', app.isPackaged);
+  logger.info('[app] starting v' + app.getVersion(), '| packaged:', app.isPackaged);
   initStorage();
   setupIPC();
   createTray();
   startClipboardMonitor();
   registerStartup();
 
+  // Pre-write helper scripts so first use has no file-write delay
+  ensureCheckScript();
+  ensurePasteScript();
+
   const candidates = ['Alt+V', 'CommandOrControl+Shift+V', 'CommandOrControl+Shift+C', 'Alt+Shift+V'];
   for (const hk of candidates) {
     if (globalShortcut.register(hk, toggleWindow)) {
-      logger.info('Hotkey registered:', hk);
+      logger.info('[hotkey] registered:', hk);
       updateTrayMenu(hk);
       break;
     }
   }
 
-  // If not launched hidden, create window immediately and show it
-  // If launched hidden (startup), defer window creation until first toggle
   const launchHidden = process.argv.includes('--hidden');
-  if (!launchHidden) {
-    createWindow();
-    showWindow();
-  }
-  // Window is created lazily on first toggleWindow() call when launchHidden
-});
+  if (!launchHidden) { createWindow(); showWindow(); }
+}).catch(err => logger.error('[app] whenReady failed:', err));
 
 app.on('will-quit', () => {
-  logger.info('App quitting');
+  logger.info('[app] quitting — flushing storage');
   globalShortcut.unregisterAll();
   if (clipboardPoller) clearTimeout(clipboardPoller);
-  // Flush any pending debounced save synchronously before the process exits.
-  // Without this, items copied in the last 400ms before shutdown are lost.
-  clearTimeout(saveTimer);
-  try { fs.writeFileSync(historyPath, JSON.stringify(historyData), 'utf8'); } catch(e) {}
-  try { fs.writeFileSync(emojiPath,   JSON.stringify(emojiData),   'utf8'); } catch(e) {}
+  flushSync();
 });
 
 app.on('window-all-closed', e => e.preventDefault());
