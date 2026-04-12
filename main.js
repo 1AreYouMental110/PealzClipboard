@@ -27,12 +27,12 @@ let isWindowVisible   = false;
 let isAnimating       = false; // guard against blur firing during show/hide
 
 // ── Text-field detection ──────────────────────────────────────────────────────
-// Checked at window-open time (while previous app still has focus).
-// true  → user was typing in a text input → auto-paste after copy
-// false → user was not in a text input    → just copy to clipboard
+// Fired at window-open time while the previous app still holds focus.
+// Returns a Promise<boolean> so the IPC handler can await it without blocking
+// the UI — the renderer gets its response instantly while the check runs async.
 
-let wasInTextField  = false;
-let checkFocusScript = null; // path to cached PS1 helper
+let textFieldCheckPromise = Promise.resolve(false);
+let checkFocusScript      = null;
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 
@@ -185,18 +185,29 @@ function makeTrayIcon() {
 
 function ensureCheckScript() {
   if (checkFocusScript) return checkFocusScript;
-  checkFocusScript = path.join(app.getPath('userData'), 'checkfocus.ps1');
+  checkFocusScript = path.join(dataDir || app.getPath('userData'), 'checkfocus.ps1');
+  // Broader detection than just ControlType IDs:
+  // • ControlType Edit (50004) = standard textbox/input
+  // • ControlType Document (50030) = rich text area
+  // • TextPattern = covers Chrome/Electron contenteditable (Discord message box, etc.)
+  // • ValuePattern (not read-only) = simpler custom inputs
   const ps = [
     'Add-Type -AssemblyName UIAutomationClient',
     'Add-Type -AssemblyName UIAutomationTypes',
     'try {',
     '  $el = [System.Windows.Automation.AutomationElement]::FocusedElement',
     '  if ($null -eq $el) { Write-Output 0; exit }',
-    '  $ct = $el.GetCurrentPropertyValue(',
-    '    [System.Windows.Automation.AutomationElement]::ControlTypeProperty)',
-    '  # Edit=50004  Document(rich editors like Discord)=50030',
-    '  if ($ct.Id -eq 50004 -or $ct.Id -eq 50030) { Write-Output 1 }',
-    '  else { Write-Output 0 }',
+    '  $ct = $el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::ControlTypeProperty)',
+    '  if ($ct.Id -eq 50004 -or $ct.Id -eq 50030) { Write-Output 1; exit }',
+    '  $pats = $el.GetSupportedPatterns()',
+    '  $tpId = [System.Windows.Automation.TextPattern]::Pattern',
+    '  if ($pats -contains $tpId) { Write-Output 1; exit }',
+    '  $vpId = [System.Windows.Automation.ValuePattern]::Pattern',
+    '  if ($pats -contains $vpId) {',
+    '    $vp = $el.GetCurrentPattern($vpId)',
+    '    if (-not $vp.Current.IsReadOnly) { Write-Output 1; exit }',
+    '  }',
+    '  Write-Output 0',
     '} catch { Write-Output 0 }'
   ].join('\r\n');
   try { fs.writeFileSync(checkFocusScript, ps, 'utf8'); }
@@ -205,18 +216,24 @@ function ensureCheckScript() {
 }
 
 function detectTextField() {
-  // Reset immediately so a stale true can't bleed into the next open
-  wasInTextField = false;
   const ps = ensureCheckScript();
-  if (!ps) return;
-  exec(
-    `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
-    { windowsHide: true, timeout: 1500 },
-    (err, stdout) => {
-      wasInTextField = !err && stdout.trim() === '1';
-      logger.info('[textfield]', wasInTextField ? 'text input detected' : 'no text input');
-    }
-  );
+  if (!ps) { textFieldCheckPromise = Promise.resolve(false); return; }
+
+  textFieldCheckPromise = new Promise((resolve) => {
+    // Safety valve: if PS takes longer than 900ms, assume no text field
+    const fallback = setTimeout(() => resolve(false), 900);
+
+    exec(
+      `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
+      { windowsHide: true, timeout: 1500 },
+      (err, stdout) => {
+        clearTimeout(fallback);
+        const result = !err && stdout.trim() === '1';
+        logger.info('[textfield]', result ? 'text input detected' : 'no text input');
+        resolve(result);
+      }
+    );
+  });
 }
 
 // ── Paste simulation ──────────────────────────────────────────────────────────
@@ -401,12 +418,12 @@ function setupIPC() {
   ipcMain.handle('copy-to-clipboard', (_e, { content }) => {
     clipboard.writeText(content);
     lastClipboardText = content;
-    if (wasInTextField) {
-      // Give the renderer ~280ms to show its toast/flash, then hide + paste
-      setTimeout(() => { hideWindow(); sendPaste(260); }, 280);
-    }
-    // Tell renderer whether we're going to auto-paste so it can show the right toast
-    return { willPaste: wasInTextField };
+    // Return immediately so the renderer shows its toast/flash with zero delay.
+    // Paste (if applicable) happens once the async text-field check resolves.
+    textFieldCheckPromise.then(inField => {
+      if (inField) { hideWindow(); sendPaste(260); }
+    });
+    return true;
   });
 
   ipcMain.handle('toggle-favorite', (_e, { id, value }) => {
@@ -442,9 +459,9 @@ function setupIPC() {
   ipcMain.handle('copy-emoji', (_e, { emoji }) => {
     clipboard.writeText(emoji);
     lastClipboardText = emoji;
-    hideWindow();
-    if (wasInTextField) sendPaste();
-    return { willPaste: wasInTextField };
+    hideWindow(); // always close immediately for emoji
+    textFieldCheckPromise.then(inField => { if (inField) sendPaste(); });
+    return true;
   });
 
   ipcMain.handle('hide-window', () => hideWindow());
@@ -488,6 +505,11 @@ app.on('will-quit', () => {
   logger.info('App quitting');
   globalShortcut.unregisterAll();
   if (clipboardPoller) clearTimeout(clipboardPoller);
+  // Flush any pending debounced save synchronously before the process exits.
+  // Without this, items copied in the last 400ms before shutdown are lost.
+  clearTimeout(saveTimer);
+  try { fs.writeFileSync(historyPath, JSON.stringify(historyData), 'utf8'); } catch(e) {}
+  try { fs.writeFileSync(emojiPath,   JSON.stringify(emojiData),   'utf8'); } catch(e) {}
 });
 
 app.on('window-all-closed', e => e.preventDefault());

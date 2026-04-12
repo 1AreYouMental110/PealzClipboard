@@ -102,11 +102,11 @@ const EmojiTab = (() => {
     btn.title       = emoji.n + (emoji.a.length ? ` (${emoji.a.slice(0,3).join(', ')})` : '');
     btn.style.animationDelay = `${Math.min(idx * 8, 150)}ms`;
 
-    // Click = copy (+ auto-paste if user was in a text field)
+    // Click = copy + auto-paste if user was typing somewhere
     btn.addEventListener('click', async () => {
-      const result = await window.api.copyEmoji({ emoji: emoji.e });
+      await window.api.copyEmoji({ emoji: emoji.e });
       Sounds.emoji();
-      showToast(result && result.willPaste ? `${emoji.e} Pasted!` : `${emoji.e} Copied!`);
+      showToast(`${emoji.e} Copied!`);
     });
 
     // Right-click = toggle favorite
