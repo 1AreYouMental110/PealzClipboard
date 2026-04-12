@@ -154,9 +154,10 @@ const ClipboardTab = (() => {
   }
 
   async function copyItem(item, card) {
-    await window.api.copyToClipboard({ content: item.content, type: item.type });
+    const result = await window.api.copyToClipboard({ content: item.content, type: item.type });
+    const willPaste = result && result.willPaste;
     Sounds.copy();
-    showToast('📋 Copied!');
+    showToast(willPaste ? '⚡ Pasted!' : '📋 Copied!');
 
     if (card) {
       card.style.transition   = 'background 0.15s, border-color 0.15s';

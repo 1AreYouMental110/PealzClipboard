@@ -26,6 +26,14 @@ let lastClipboardText = '';
 let isWindowVisible   = false;
 let isAnimating       = false; // guard against blur firing during show/hide
 
+// ── Text-field detection ──────────────────────────────────────────────────────
+// Checked at window-open time (while previous app still has focus).
+// true  → user was typing in a text input → auto-paste after copy
+// false → user was not in a text input    → just copy to clipboard
+
+let wasInTextField  = false;
+let checkFocusScript = null; // path to cached PS1 helper
+
 // ── Storage ───────────────────────────────────────────────────────────────────
 
 let dataDir     = '';
@@ -170,6 +178,47 @@ function makeTrayIcon() {
   return nativeImage.createFromDataURL('data:image/png;base64,' + b64);
 }
 
+// ── Text-field focus check ────────────────────────────────────────────────────
+// Uses Windows UIAutomation to ask "is the currently focused element a text
+// input?".  We write a tiny PS1 script once on first use and reuse it, so
+// there's no repeated file-write overhead.
+
+function ensureCheckScript() {
+  if (checkFocusScript) return checkFocusScript;
+  checkFocusScript = path.join(app.getPath('userData'), 'checkfocus.ps1');
+  const ps = [
+    'Add-Type -AssemblyName UIAutomationClient',
+    'Add-Type -AssemblyName UIAutomationTypes',
+    'try {',
+    '  $el = [System.Windows.Automation.AutomationElement]::FocusedElement',
+    '  if ($null -eq $el) { Write-Output 0; exit }',
+    '  $ct = $el.GetCurrentPropertyValue(',
+    '    [System.Windows.Automation.AutomationElement]::ControlTypeProperty)',
+    '  # Edit=50004  Document(rich editors like Discord)=50030',
+    '  if ($ct.Id -eq 50004 -or $ct.Id -eq 50030) { Write-Output 1 }',
+    '  else { Write-Output 0 }',
+    '} catch { Write-Output 0 }'
+  ].join('\r\n');
+  try { fs.writeFileSync(checkFocusScript, ps, 'utf8'); }
+  catch(e) { logger.warn('[textfield] script write failed:', e.message); checkFocusScript = null; }
+  return checkFocusScript;
+}
+
+function detectTextField() {
+  // Reset immediately so a stale true can't bleed into the next open
+  wasInTextField = false;
+  const ps = ensureCheckScript();
+  if (!ps) return;
+  exec(
+    `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
+    { windowsHide: true, timeout: 1500 },
+    (err, stdout) => {
+      wasInTextField = !err && stdout.trim() === '1';
+      logger.info('[textfield]', wasInTextField ? 'text input detected' : 'no text input');
+    }
+  );
+}
+
 // ── Paste simulation ──────────────────────────────────────────────────────────
 // Sends Ctrl+V to whatever window has focus after we hide.
 // Uses WScript.Shell which is built into every Windows install — no extra deps.
@@ -271,6 +320,9 @@ function showWindow() {
   // Lazy creation — if window was never built (--hidden startup) build now
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
 
+  // Check NOW — previous app still has focus (showInactive hasn't run yet)
+  detectTextField();
+
   const { x, y } = getWindowPos();
   mainWindow.setPosition(x, y);
 
@@ -349,10 +401,12 @@ function setupIPC() {
   ipcMain.handle('copy-to-clipboard', (_e, { content }) => {
     clipboard.writeText(content);
     lastClipboardText = content;
-    // Hide window then paste into the previously focused app
-    hideWindow();
-    sendPaste();
-    return true;
+    if (wasInTextField) {
+      // Give the renderer ~280ms to show its toast/flash, then hide + paste
+      setTimeout(() => { hideWindow(); sendPaste(260); }, 280);
+    }
+    // Tell renderer whether we're going to auto-paste so it can show the right toast
+    return { willPaste: wasInTextField };
   });
 
   ipcMain.handle('toggle-favorite', (_e, { id, value }) => {
@@ -389,8 +443,8 @@ function setupIPC() {
     clipboard.writeText(emoji);
     lastClipboardText = emoji;
     hideWindow();
-    sendPaste();
-    return true;
+    if (wasInTextField) sendPaste();
+    return { willPaste: wasInTextField };
   });
 
   ipcMain.handle('hide-window', () => hideWindow());
