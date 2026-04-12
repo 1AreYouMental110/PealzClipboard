@@ -1,0 +1,50 @@
+{
+  "name": "clipboard-manager",
+  "version": "1.0.0",
+  "description": "Custom clipboard manager and emoji picker",
+  "main": "main.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1AreYouMental110/PealzClipboard.git"
+  },
+  "scripts": {
+    "start":   "electron .",
+    "dist":    "electron-builder --win --x64",
+    "release": "electron-builder --win --x64 --publish always"
+  },
+  "dependencies": {
+    "electron":        "^29.1.0",
+    "electron-updater": "^6.8.3"
+  },
+  "devDependencies": {
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId":       "com.pealz.clipboardmanager",
+    "productName": "Clipboard Manager",
+    "publish": {
+      "provider": "github",
+      "owner":    "1AreYouMental110",
+      "repo":     "PealzClipboard"
+    },
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick":         true,
+      "perMachine":       false,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "logger.js",
+      "updater.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": []
+  }
+}

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clipboard Manager</title>
+<link rel="stylesheet" href="styles/app.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Update banner (hidden until update available) -->
+  <div class="update-banner hidden" id="updateBanner">
+    <span class="update-banner-text" id="updateBannerText"></span>
+    <button class="update-banner-btn" id="updateBannerBtn">Restart</button>
+  </div>
+
+  <!-- Titlebar -->
+  <div class="titlebar">
+    <span class="titlebar-title">Clipboard</span>
+    <button class="btn-close" id="btnClose" title="Close (Esc)">✕</button>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="clipboard">
+      <span class="tab-icon">📋</span>
+      <span>Clipboard</span>
+    </button>
+    <button class="tab-btn" data-tab="emoji">
+      <span class="tab-icon">😊</span>
+      <span>Emoji</span>
+    </button>
+    <div class="tab-indicator"></div>
+  </div>
+
+  <!-- Panels -->
+  <div class="panels-wrap">
+
+    <!-- Clipboard panel -->
+    <div class="panel active" id="panel-clipboard">
+      <div class="search-bar">
+        <span class="search-icon">🔍</span>
+        <input id="clipSearch" type="text" placeholder="Search history…" autocomplete="off" spellcheck="false">
+        <button class="search-clear hidden" id="clipSearchClear">✕</button>
+      </div>
+
+      <div class="filter-row">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="favorites">⭐ Favorites</button>
+        <div class="spacer"></div>
+        <button class="action-link" id="btnClearHistory">Clear</button>
+      </div>
+
+      <div class="clip-list" id="clipList">
+        <div class="empty-state" id="clipEmpty">
+          <div class="empty-icon">📋</div>
+          <div class="empty-title">No clipboard history</div>
+          <div class="empty-sub">Copy something to get started</div>
+        </div>
+      </div>
+
+      <div class="panel-footer">
+        <span id="clipCount" class="clip-count"></span>
+      </div>
+    </div>
+
+    <!-- Emoji panel -->
+    <div class="panel" id="panel-emoji">
+      <div class="search-bar">
+        <span class="search-icon">🔍</span>
+        <input id="emojiSearch" type="text" placeholder="Search… try: rock on, party, laughing" autocomplete="off" spellcheck="false">
+        <button class="search-clear hidden" id="emojiSearchClear">✕</button>
+      </div>
+
+      <div class="emoji-categories" id="emojiCategories"></div>
+
+      <div class="emoji-grid-wrap">
+        <div class="emoji-grid" id="emojiGrid"></div>
+      </div>
+
+      <div class="panel-footer">
+        <span id="emojiHint" class="clip-count">Click to copy · Right-click to favorite</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="data/emojis.js"></script>
+<script src="scripts/sounds.js"></script>
+<script src="scripts/clipboard-tab.js"></script>
+<script src="scripts/emoji-tab.js"></script>
+<script src="scripts/app.js"></script>
+</body>
+</html>
