@@ -32,9 +32,6 @@
   window.api.onWindowShowing(animateIn);
   window.api.onWindowHiding(animateOut);
 
-  // Play entry animation on first load
-  animateIn();
-
   // ── Close button ─────────────────────────────────────────────────────────
   document.getElementById('btnClose').addEventListener('click', () => {
     window.api.hideWindow();
