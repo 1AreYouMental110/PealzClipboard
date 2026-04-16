@@ -114,11 +114,10 @@ function registerStartup() {
 
   if (app.isPackaged) {
     // Packaged app: register the installed .exe in the Windows registry startup key.
-    // The BAT-file approach pointed at electron.cmd in node_modules which doesn't
-    // exist in a packaged build — this is the correct Electron API for this.
+    // Explicitly pass path so Electron doesn't fall back to guessing the exe location.
     try {
-      app.setLoginItemSettings({ openAtLogin: true, args: ['--hidden'] });
-      logger.info('[startup] registered via loginItemSettings (packaged exe)');
+      app.setLoginItemSettings({ openAtLogin: true, path: process.execPath, args: ['--hidden'] });
+      logger.info('[startup] registered via loginItemSettings (packaged exe):', process.execPath);
     } catch(e) {
       logger.warn('[startup] loginItemSettings failed:', e.message);
     }
@@ -141,34 +140,37 @@ function registerStartup() {
 }
 
 // ── Clipboard monitor ─────────────────────────────────────────────────────────
-// Poll every 500ms always. Clipboard reads are extremely cheap (single Win32
-// call) so there is no meaningful CPU cost. 2s was too slow — users copying
-// multiple things quickly or opening the window right after a copy would miss
-// items entirely.
-const POLL_INTERVAL = 500;
+// Poll every 200ms. After detecting a change, re-poll in 100ms so that rapid
+// sequential copies (A then B within one interval) are both captured. Two
+// copies within 100ms is extremely rare in real use; 500ms was the common miss.
+const POLL_INTERVAL       = 200;
+const RAPID_POLL_INTERVAL = 100;
 
 function startClipboardMonitor() {
   try { lastClipboardText = clipboard.readText(); } catch {}
-  scheduleNextPoll();
+  scheduleNextPoll(POLL_INTERVAL);
 }
 
-function scheduleNextPoll() {
+function scheduleNextPoll(delay) {
   if (clipboardPoller) return;
-  clipboardPoller = setTimeout(pollClipboard, POLL_INTERVAL);
+  clipboardPoller = setTimeout(pollClipboard, delay ?? POLL_INTERVAL);
 }
 
 function pollClipboard() {
   clipboardPoller = null;
+  let changed = false;
   try {
     const text = clipboard.readText();
     if (text && text !== lastClipboardText && text.trim().length > 0) {
       lastClipboardText = text;
       addClipboardItem(text, 'text');
+      changed = true;
     }
   } catch(e) {
     logger.warn('[clipboard] read error:', e.message);
   }
-  scheduleNextPoll();
+  // Re-poll sooner after a change to catch rapid sequential copies
+  scheduleNextPoll(changed ? RAPID_POLL_INTERVAL : POLL_INTERVAL);
 }
 
 // Immediate one-off poll — called when window opens so the list is always
@@ -177,6 +179,7 @@ function pollNow() {
   if (clipboardPoller) { clearTimeout(clipboardPoller); clipboardPoller = null; }
   pollClipboard();
 }
+
 
 function addClipboardItem(content, type) {
   const items = historyData.items;
@@ -609,7 +612,13 @@ app.whenReady().then(() => {
   }
 
   const launchHidden = process.argv.includes('--hidden');
-  if (!launchHidden) { createWindow(); showWindow(); }
+  if (launchHidden) {
+    // Pre-create the window hidden so the first hotkey press opens instantly
+    createWindow();
+  } else {
+    createWindow();
+    showWindow();
+  }
 }).catch(err => logger.error('[app] whenReady failed:', err));
 
 app.on('will-quit', () => {
