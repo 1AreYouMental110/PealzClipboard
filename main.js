@@ -106,19 +106,37 @@ function flushSync() {
 
 // ── Startup registration ──────────────────────────────────────────────────────
 function registerStartup() {
-  try {
-    const appDir      = path.resolve(__dirname);
-    const electronCmd = path.join(appDir, 'node_modules', '.bin', 'electron.cmd');
-    const batPath = path.join(
-      process.env.APPDATA,
-      'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup',
-      'ClipboardManager.bat'
-    );
-    const bat = ['@echo off', `cd /d "${appDir}"`, `start "" /B "${electronCmd}" . --hidden`, ''].join('\r\n');
-    fs.writeFileSync(batPath, bat, 'utf8');
-    logger.info('[startup] registered:', batPath);
-  } catch(e) {
-    logger.warn('[startup] could not register:', e.message);
+  const batPath = path.join(
+    process.env.APPDATA,
+    'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup',
+    'ClipboardManager.bat'
+  );
+
+  if (app.isPackaged) {
+    // Packaged app: register the installed .exe in the Windows registry startup key.
+    // The BAT-file approach pointed at electron.cmd in node_modules which doesn't
+    // exist in a packaged build — this is the correct Electron API for this.
+    try {
+      app.setLoginItemSettings({ openAtLogin: true, args: ['--hidden'] });
+      logger.info('[startup] registered via loginItemSettings (packaged exe)');
+    } catch(e) {
+      logger.warn('[startup] loginItemSettings failed:', e.message);
+    }
+    // Clean up any old dev-mode BAT stub if it was left behind
+    try {
+      if (fs.existsSync(batPath)) { fs.unlinkSync(batPath); logger.info('[startup] removed stale bat stub'); }
+    } catch {}
+  } else {
+    // Dev mode: write a bat file pointing to electron.cmd in node_modules
+    try {
+      const appDir      = path.resolve(__dirname);
+      const electronCmd = path.join(appDir, 'node_modules', '.bin', 'electron.cmd');
+      const bat = ['@echo off', `cd /d "${appDir}"`, `start "" /B "${electronCmd}" . --hidden`, ''].join('\r\n');
+      fs.writeFileSync(batPath, bat, 'utf8');
+      logger.info('[startup] dev mode registered:', batPath);
+    } catch(e) {
+      logger.warn('[startup] could not register:', e.message);
+    }
   }
 }
 
@@ -201,8 +219,7 @@ function queryHistory({ search, favoritesOnly, limit = 500, offset = 0 } = {}) {
 // Fired at window-open time while the previous app still holds focus.
 // Resolves to true = user was in a text input → auto-paste after copy.
 
-let textFieldCheckPromise = Promise.resolve(false);
-let checkFocusScript      = null;
+let checkFocusScript = null;
 
 function ensureCheckScript() {
   if (checkFocusScript) return checkFocusScript;
@@ -242,27 +259,20 @@ function ensureCheckScript() {
 
 function detectTextField() {
   const ps = ensureCheckScript();
-  if (!ps) { textFieldCheckPromise = Promise.resolve(false); return; }
-
-  textFieldCheckPromise = new Promise((resolve) => {
-    // Hard cap: if PS takes >1500ms, default to false
-    const fallback = setTimeout(() => resolve(false), 1500);
-
-    exec(
-      `powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
-      { windowsHide: true, timeout: 2000 },
-      (err, stdout) => {
-        clearTimeout(fallback);
-        const output  = (stdout || '').trim();
-        const [inFieldStr, pidStr] = output.split(':');
-        const inField = !err && inFieldStr === '1';
-        const pid     = parseInt(pidStr || '0') || 0;
-        if (pid > 0) previousPid = pid;   // Always store — used by paste even if !inField
-        logger.info('[textfield]', inField ? 'text input detected' : 'not in text input', `pid=${pid}`);
-        resolve(inField);
-      }
-    );
-  });
+  if (!ps) return;
+  // Fire-and-forget: capture the source app PID so AppActivate can restore focus during paste.
+  // Paste always fires after copy — no longer gated on an "inField" check (that detection
+  // was unreliable for Electron/Chrome apps and meant paste never worked for Discord etc.).
+  exec(
+    `powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${ps}"`,
+    { windowsHide: true, timeout: 1500 },
+    (err, stdout) => {
+      const [, pidStr] = (stdout || '').trim().split(':');
+      const pid = parseInt(pidStr || '0') || 0;
+      if (pid > 0) previousPid = pid;
+      logger.info('[textfield] source pid captured:', pid);
+    }
+  );
 }
 
 // ── Paste ─────────────────────────────────────────────────────────────────────
@@ -513,16 +523,12 @@ function setupIPC() {
   safeHandle('copy-to-clipboard', (_e, { content }) => {
     clipboard.writeText(content);
     lastClipboardText = content;
-    // Paste fires asynchronously once the text-field check resolves.
-    // blur() hands focus back to the previous app BEFORE we paste —
-    // without it, Discord/etc. won't have focus when Ctrl+V fires.
-    textFieldCheckPromise.then(inField => {
-      if (inField) {
-        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.blur(); } catch {}
-        sendPaste(500); // 500ms: 200ms hide animation + 300ms focus transfer buffer
-      }
-      hideWindow(); // always close the picker after copying
-    }).catch(() => hideWindow());
+    // Always paste: blur defocuses immediately, hide starts the 200ms animation,
+    // and the 350ms paste delay fires after the window is gone + focus has returned
+    // to the previous app (whose PID was captured by detectTextField at show-time).
+    try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.blur(); } catch {}
+    hideWindow();
+    sendPaste(350);
     return true;
   });
 
@@ -559,13 +565,9 @@ function setupIPC() {
   safeHandle('copy-emoji', (_e, { emoji }) => {
     clipboard.writeText(emoji);
     lastClipboardText = emoji;
-    textFieldCheckPromise.then(inField => {
-      if (inField) {
-        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.blur(); } catch {}
-        sendPaste(500);
-      }
-      hideWindow();
-    }).catch(() => hideWindow());
+    try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.blur(); } catch {}
+    hideWindow();
+    sendPaste(350);
     return true;
   });
 

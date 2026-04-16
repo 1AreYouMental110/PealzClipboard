@@ -3,6 +3,7 @@
 // Aliases cover common slang, alternate names, and context clues for weirdly-named emojis
 
 const EMOJI_CATEGORIES = [
+  'All',
   'Favorites',
   'Smileys',
   'People',

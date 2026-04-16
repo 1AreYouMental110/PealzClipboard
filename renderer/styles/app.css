@@ -452,10 +452,20 @@ html, body {
   background: transparent;
   border-radius: var(--r-sm);
   cursor: pointer;
-  font-size: 22px;
+  font-size: 22px;  /* used only by the native-emoji onerror fallback */
   display: flex; align-items: center; justify-content: center;
   transition: background 0.1s, transform 0.12s var(--ease-spring);
   position: relative;
+}
+
+/* Twemoji SVG images (Discord/jdecked open-source set) */
+.emoji-btn .twemoji {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  pointer-events: none;
+  display: block;
+  image-rendering: crisp-edges;
 }
 .emoji-btn:hover {
   background: var(--bg-card-hover);

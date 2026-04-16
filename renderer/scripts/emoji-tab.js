@@ -2,9 +2,9 @@
 
 const EmojiTab = (() => {
 
-  let favorites    = new Set();
-  let activeCategory = 'Favorites';
-  let searchQuery  = '';
+  let favorites      = new Set();
+  let activeCategory = 'All';
+  let searchQuery    = '';
   let renderTimer  = null;
 
   const gridEl     = () => document.getElementById('emojiGrid');
@@ -47,13 +47,22 @@ const EmojiTab = (() => {
 
   // ── Grid render ───────────────────────────────────────────────────────────
   function getVisibleEmojis() {
-    if (searchQuery.trim()) {
-      return searchEmojis(searchQuery);
-    }
-    if (activeCategory === 'Favorites') {
-      return EMOJIS.filter(e => favorites.has(e.e));
-    }
+    if (searchQuery.trim()) return searchEmojis(searchQuery);
+    if (activeCategory === 'All') return EMOJIS;
+    if (activeCategory === 'Favorites') return EMOJIS.filter(e => favorites.has(e.e));
     return EMOJIS.filter(e => e.c === activeCategory);
+  }
+
+  // ── Twemoji CDN URL ───────────────────────────────────────────────────────
+  // Discord/Twitter's open-source Twemoji library (jdecked fork) renders
+  // consistent cross-platform emoji glyphs via SVG. We strip variation
+  // selector U+FE0F from the codepoint sequence as Twemoji omits it in filenames.
+  function twemojiUrl(emoji) {
+    const cps = [...emoji]
+      .map(c => c.codePointAt(0))
+      .filter(cp => cp !== 0xFE0F);
+    const hex = cps.map(cp => cp.toString(16)).join('-');
+    return `https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/${hex}.svg`;
   }
 
   function renderGrid() {
@@ -97,10 +106,24 @@ const EmojiTab = (() => {
 
   function buildEmojiBtn(emoji, idx) {
     const btn = document.createElement('button');
-    btn.className   = 'emoji-btn' + (favorites.has(emoji.e) ? ' favorited' : '');
-    btn.textContent = emoji.e;
-    btn.title       = emoji.n + (emoji.a.length ? ` (${emoji.a.slice(0,3).join(', ')})` : '');
+    btn.className = 'emoji-btn' + (favorites.has(emoji.e) ? ' favorited' : '');
+    btn.title     = emoji.n + (emoji.a.length ? ` (${emoji.a.slice(0,3).join(', ')})` : '');
     btn.style.animationDelay = `${Math.min(idx * 8, 150)}ms`;
+
+    // Twemoji SVG image (Discord's open-source emoji set via jdecked/twemoji CDN)
+    const img = document.createElement('img');
+    img.src       = twemojiUrl(emoji.e);
+    img.alt       = emoji.e;
+    img.draggable = false;
+    img.loading   = 'lazy';   // only fetch when scrolled into view
+    img.className = 'twemoji';
+    img.onerror = () => {
+      // CDN unavailable (offline) — fall back to system emoji glyph
+      img.remove();
+      btn.textContent  = emoji.e;
+      btn.style.fontSize = '20px';
+    };
+    btn.appendChild(img);
 
     // Click = copy + auto-paste if user was typing somewhere
     btn.addEventListener('click', async () => {
